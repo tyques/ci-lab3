@@ -33,6 +33,7 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-webmvc'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.springframework.boot:spring-boot-starter-validation'
+    implementation 'org.springframework.boot:spring-boot-starter-data-redis'
     implementation("org.modelmapper:modelmapper:3.2.0")
     implementation 'org.springdoc:springdoc-openapi-starter-webmvc-ui:3.0.3'
     compileOnly 'org.projectlombok:lombok'
@@ -42,7 +43,23 @@ dependencies {
     developmentOnly 'org.springframework.boot:spring-boot-devtools'
     testImplementation 'org.springframework.boot:spring-boot-starter-test'
     testImplementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
+    // Spring Boot 4.0.8 больше не управляет версиями Testcontainers — указываем явно
+    testImplementation 'org.testcontainers:junit-jupiter:1.21.3'
+    testImplementation 'org.testcontainers:postgresql:1.21.3'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+sourceSets {
+    integrationTest {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+
+// Интеграционные тесты используют те же зависимости, что и юнит-тесты (spring-boot-starter-test, Testcontainers)
+configurations {
+    integrationTestImplementation.extendsFrom testImplementation
+    integrationTestRuntimeOnly.extendsFrom testRuntimeOnly
 }
 
 tasks.named('test') {
@@ -55,4 +72,50 @@ tasks.register('resolveDependencies') {
     doLast {
         classpaths.each { it.resolve() }
     }
+}
+
+def integrationForks = (project.findProperty('integrationForks') ?: '1').toInteger()
+
+tasks.register('integrationTest', Test) {
+    description = 'Runs integration tests against ephemeral PostgreSQL and Redis via Testcontainers.'
+    group = 'verification'
+    testClassesDirs = sourceSets.integrationTest.output.classesDirs
+    classpath = sourceSets.integrationTest.runtimeClasspath
+    shouldRunAfter test
+
+    useJUnitPlatform()
+
+    // У пользователя в ~/.testcontainers.properties зафиксирована UnixSocket-стратегия,
+    // которая не работает с Docker Desktop/Colima. Системное свойство имеет высший приоритет
+    // и переопределяет её: стратегия читает DOCKER_HOST из окружения, а в CI откатывается на
+    // дефолтный сокет /var/run/docker.sock.
+    systemProperty 'docker.client.strategy', 'org.testcontainers.dockerclient.EnvironmentAndSystemPropertyClientProviderStrategy'
+
+    // docker-java по умолчанию шлёт API-версию 1.32, а Colima требует >= 1.44.
+    // docker-java читает ключ системного свойства "api.version". 1.44 поддерживается и
+    // обычным docker в CI (ubuntu-latest), поэтому значение портируемо.
+    systemProperty 'api.version', '1.44'
+    if (System.getenv('DOCKER_HOST')) {
+        environment 'DOCKER_HOST', System.getenv('DOCKER_HOST')
+        // Colima (Docker в виртуалке) не может примонтировать host-сокет в reaper-контейнер
+        // Ryuk, из-за чего его старт падает. Отключаем Ryuk только для нестандартного docker:
+        // @Container контейнеры всё равно останавливаются JUnit-расширением Testcontainers.
+        environment 'TESTCONTAINERS_RYUK_DISABLED', 'true'
+    }
+
+    // Количество JVM-форков. По умолчанию 1 (последовательно).
+    // Запуск параллельно: ./gradlew integrationTest -PintegrationForks=4
+    maxParallelForks = integrationForks
+
+    // Заставляем Gradle по возможности переиспользовать даемон-процессы не мешая параллельным форкам
+    maxHeapSize = '1g'
+
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat 'full'
+    }
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('integrationTest')
 }

@@ -88,14 +88,85 @@
 
 ## Тестирование
 
-Проект содержит как юнит-тесты для сервисного слоя, так и интеграционные тесты для контроллеров.
+Проект содержит юнит-тесты для сервисного слоя и интеграционные тесты (Testcontainers) для
+взаимодействия с реальными PostgreSQL и Redis.
 
-Для запуска всех тестов выполните команду:
+### Юнит-тесты (быстрые, без Docker)
+
 ```bash
 ./gradlew test
 ```
 
-Отчет о покрытии и результатах тестов будет сгенерирован в директории `build/reports/tests/test/index.html`.
+Отчет: `build/reports/tests/test/index.html`.
+
+### Интеграционные тесты (Testcontainers)
+
+Интеграционные тесты находятся в отдельном source set `src/integrationTest`. При запуске они
+поднимают эфемерные контейнеры **PostgreSQL 16** и **Redis 7** через Testcontainers, а затем
+проверяют сквозное взаимодействие: персистентность в PostgreSQL, кэширование продавцов в Redis,
+инвалидацию кэша при обновлении/удалении и аналитику по транзакциям.
+
+Запуск (требуется работающий Docker):
+
+```bash
+./gradlew integrationTest
+```
+
+Отчет: `build/reports/tests/integrationTest/index.html`.
+
+### Параллельное выполнение интеграционных тестов
+
+Количество JVM-форков задаётся свойством `integrationForks` (по умолчанию `1` — последовательно):
+
+```bash
+# последовательно
+./gradlew integrationTest -PintegrationForks=1
+
+# параллельно (4 форка)
+./gradlew integrationTest -PintegrationForks=4
+```
+
+Замер на локальной машине (2 тестовых класса, 7 тестов, каждый поднимает свой набор контейнеров):
+
+| Режим | Время (wall-clock) |
+|-------|--------------------|
+| Последовательно (`integrationForks=1`) | ~7.2 c |
+| Параллельно (`integrationForks=4`)      | ~6.5 c |
+
+Параллельный запуск запускает контейнеры и контексты тестовых классов одновременно, что сокращает
+общее время. Полный запуск всех тестов (юнит + интеграция) — `./gradlew build`.
+
+> **Примечание для окружений с нестандартным Docker (Colima/Docker Machine).**
+> В `build.gradle` для задачи `integrationTest` включена переопределяемая стратегия подключения
+> к Docker (`EnvironmentAndSystemPropertyClientProviderStrategy`), которая читает `DOCKER_HOST`
+> из окружения, и фиксированная версия Docker API `1.44`. В CI (дефолтный docker-сокет) эти
+> настройки безвредны и откатываются на стандартное поведение.
+
+## CI/CD и GitOps
+
+Пайплайн описан в `.github/workflows/ci.yml` (GitHub Actions). Джобы и зависимости:
+
+```
+test  ──►  integration-tests  ──►  docker (build + publish)  ──►  promote-staging  ──►  update-gitops
+         (Testcontainers,                  сборка и публикация           копия манифеста          GitOps:
+          parallel)                        ТОЛЬКО после тестов           в staging без rebuild    коммит тега
+```
+
+- **`test`** — юнит-тесты.
+- **`integration-tests`** (`needs: test`) — интеграционные тесты Testcontainers, запускаются
+  параллельно (`-PintegrationForks=4`).
+- **`docker`** (`needs: [test, integration-tests]`) — сборка, сканирование Trivy и **публикация**
+  образа в GHCR происходят только после успешного прохождения обеих стадий тестов.
+- **`promote-staging`** (`needs: docker`, только для `master`) — продвигает проверенный образ
+  в `:staging` через `docker buildx imagetools create`, т.е. **без повторной сборки** (копируется
+  манифест в реестре).
+- **`update-gitops`** (`needs: promote-staging`) — автоматически обновляет тег образа
+  в манифесте `k8s/crm-deployment.yaml` и коммитит его в ветку `gitops`. Это и есть механика
+  GitOps: Git является единственным источником истины, а внешний контроллер (Argo CD / Flux)
+  синхронизирует состояние кластера с этой веткой. Отдельная ветка `gitops` не запускает
+  пайплайн повторно и не создаёт циклов.
+
+Kubernetes-манифесты: `k8s/crm-deployment.yaml`, `k8s/crm-service.yaml`.
 
 ## Примеры использования API (Эндпоинты)
 

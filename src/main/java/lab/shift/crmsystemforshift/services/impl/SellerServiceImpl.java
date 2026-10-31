@@ -9,6 +9,8 @@ import lab.shift.crmsystemforshift.mappers.Mapper;
 import lab.shift.crmsystemforshift.repositories.SellerRepository;
 import lab.shift.crmsystemforshift.services.SellerService;
 import lombok.AllArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -40,6 +42,7 @@ public class SellerServiceImpl implements SellerService {
 
     @Override
     @Transactional(readOnly = true)
+    @Cacheable(cacheNames = "sellers", key = "#id")
     public SellerResponse getSellerById(Long id) {
         return sellerRepository.findById(id)
                 .map(mapper::mapToDto)
@@ -59,6 +62,7 @@ public class SellerServiceImpl implements SellerService {
 
     @Override
     @Transactional
+    @CacheEvict(cacheNames = "sellers", key = "#id")
     public SellerResponse updateSeller(Long id, SellerUpdateRequest request) {
         SellerEntity sellerToUpdate = sellerRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Seller with id " + id + " not found"));
@@ -72,6 +76,7 @@ public class SellerServiceImpl implements SellerService {
 
     @Override
     @Transactional
+    @CacheEvict(cacheNames = "sellers", key = "#id")
     public void deleteSeller(Long id) {
         if (!sellerRepository.existsById(id)) {
             throw new ResourceNotFoundException("Seller with id " + id + " not found");
