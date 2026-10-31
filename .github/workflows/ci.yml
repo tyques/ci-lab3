@@ -10,6 +10,9 @@ permissions:
   contents: read
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Юнит-тесты (быстрые, без Docker)
+  # ---------------------------------------------------------------------------
   test:
     runs-on: ubuntu-latest
     steps:
@@ -22,11 +25,41 @@ jobs:
           java-version: '25'
           cache: gradle
 
-      - name: Тесты
+      - name: Юнит-тесты
         run: ./gradlew test
 
-  docker:
+  # ---------------------------------------------------------------------------
+  # 2. Интеграционные тесты (Testcontainers: PostgreSQL + Redis в эфемерных контейнерах)
+  #    Запускаются ПАРАЛЛЕЛЬНО (integrationForks=4). Требуют Docker.
+  # ---------------------------------------------------------------------------
+  integration-tests:
+    runs-on: ubuntu-latest
     needs: test
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Установка JDK 25
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: gradle
+
+      - name: Интеграционные тесты (параллельно)
+        run: ./gradlew integrationTest -PintegrationForks=4
+
+      - name: Публикация отчёта интеграционных тестов
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: integration-test-report
+          path: build/reports/tests/integrationTest/
+
+  # ---------------------------------------------------------------------------
+  # 3. Сборка и публикация образа — только после успешных юнит- и интеграционных тестов
+  # ---------------------------------------------------------------------------
+  docker:
+    needs: [test, integration-tests]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -100,3 +133,81 @@ jobs:
         run: |
           docker push "$IMAGE:$SHORT_SHA"
           docker push "$IMAGE:build-${{ github.run_number }}"
+
+  # ---------------------------------------------------------------------------
+  # 4. Промоушен проверенного образа в staging БЕЗ повторной сборки.
+  #    buildx imagetools копирует манифест в реестре (не тянет и не пересобирает).
+  # ---------------------------------------------------------------------------
+  promote-staging:
+    needs: docker
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Определение имени образа
+        run: |
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Вход в GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Промоушен в staging (копия манифеста, без rebuild)
+        run: |
+          docker buildx imagetools create \
+            --tag "$IMAGE:staging" \
+            "$IMAGE:$SHORT_SHA"
+          docker buildx imagetools inspect "$IMAGE:staging"
+
+  # ---------------------------------------------------------------------------
+  # 5. GitOps: автоматическое обновление Kubernetes-манифеста в Git.
+  #    После промоушена в staging в ветку gitops коммитится новый тег образа.
+  #    Внешний контроллер (Argo CD / Flux) смониторит эту ветку и применяет состояние.
+  # ---------------------------------------------------------------------------
+  update-gitops:
+    needs: promote-staging
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Определение имени образа и тега
+        run: |
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: Подготовка ветки gitops (создаётся из master при первом запуске)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code origin gitops >/dev/null 2>&1; then
+            git checkout -B gitops origin/gitops
+          else
+            git checkout -b gitops
+          fi
+
+      - name: Обновление тега образа в манифесте
+        run: |
+          sed -i "s|image: ghcr.io/[^:]*:.*|image: ${IMAGE}:staging|" k8s/crm-deployment.yaml
+          grep -n "image:" k8s/crm-deployment.yaml
+
+      - name: Коммит и пуш в ветку gitops
+        run: |
+          git add k8s/crm-deployment.yaml
+          if git diff --cached --quiet; then
+            echo "Манифест уже актуален — изменений нет"
+          else
+            git commit -m "chore(gitops): promote image to staging (${SHORT_SHA})"
+            git push origin gitops
+          fi
