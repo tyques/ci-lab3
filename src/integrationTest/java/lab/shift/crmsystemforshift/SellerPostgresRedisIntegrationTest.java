@@ -49,6 +49,25 @@ class SellerPostgresRedisIntegrationTest extends AbstractIntegrationTest {
         sellerRepository.deleteAll();
     }
 
+    /**
+     * Запись/инвалидация кэша в Redis через отдельный {@link StringRedisTemplate} видна не мгновенно
+     * (соединение кэш-райтера и шаблона могут отличаться). Поэтому состояние ключа опрашиваем
+     * короткий период вместо единичного мгновенного assert.
+     */
+    private void awaitCacheKey(String cacheKey, boolean shouldBePresent) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + 5000;
+        while (System.currentTimeMillis() < deadline
+                && Boolean.TRUE.equals(redis.hasKey(cacheKey)) != shouldBePresent) {
+            Thread.sleep(50);
+        }
+        boolean present = Boolean.TRUE.equals(redis.hasKey(cacheKey));
+        if (shouldBePresent) {
+            assertTrue(present, "Кэш должен содержать ключ: " + cacheKey);
+        } else {
+            assertFalse(present, "Кэш должен быть сброшен: " + cacheKey);
+        }
+    }
+
     @Test
     void createSeller_persistsInPostgres() {
         SellerResponse created = sellerService.createSeller(new SellerCreateRequest("Иван Иванов", "ivan@mail.com"));
@@ -61,43 +80,41 @@ class SellerPostgresRedisIntegrationTest extends AbstractIntegrationTest {
     }
 
     @Test
-    void getSellerById_cachesResultInRedis() {
+    void getSellerById_cachesResultInRedis() throws InterruptedException {
         SellerResponse created = sellerService.createSeller(new SellerCreateRequest("Пётр Петров", "petr@mail.com"));
 
         sellerService.getSellerById(created.getSellerId());
 
         String cacheKey = "sellers::" + created.getSellerId();
-        assertTrue(Boolean.TRUE.equals(redis.hasKey(cacheKey)),
-                "После getSellerById в Redis должен появиться ключ кэша: " + cacheKey);
+        awaitCacheKey(cacheKey, true);
     }
 
     @Test
-    void updateSeller_evictsCache() {
+    void updateSeller_evictsCache() throws InterruptedException {
         SellerResponse created = sellerService.createSeller(new SellerCreateRequest("Анна", "anna@mail.com"));
 
         sellerService.getSellerById(created.getSellerId());
         String cacheKey = "sellers::" + created.getSellerId();
-        assertTrue(Boolean.TRUE.equals(redis.hasKey(cacheKey)));
+        awaitCacheKey(cacheKey, true);
 
         sellerService.updateSeller(
                 created.getSellerId(),
                 new SellerUpdateRequest(created.getSellerId(), "Анна Смирнова", "anna.smirnova@mail.com"));
 
-        assertFalse(Boolean.TRUE.equals(redis.hasKey(cacheKey)),
-                "После обновления продавца кэш должен быть сброшен");
+        awaitCacheKey(cacheKey, false);
     }
 
     @Test
-    void deleteSeller_softDeletesInPostgresAndEvictsCache() {
+    void deleteSeller_softDeletesInPostgresAndEvictsCache() throws InterruptedException {
         SellerResponse created = sellerService.createSeller(new SellerCreateRequest("Олег Олегов", "oleg@mail.com"));
 
         sellerService.getSellerById(created.getSellerId());
         String cacheKey = "sellers::" + created.getSellerId();
+        awaitCacheKey(cacheKey, true);
 
         sellerService.deleteSeller(created.getSellerId());
 
-        assertFalse(Boolean.TRUE.equals(redis.hasKey(cacheKey)),
-                "После удаления продавца кэш должен быть сброшен");
+        awaitCacheKey(cacheKey, false);
         assertTrue(sellerRepository.findById(created.getSellerId()).isEmpty(),
                 "Продавец не должен возвращаться активным запросом");
         assertTrue(sellerRepository.findAllWithDeleted().stream()

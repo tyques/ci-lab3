@@ -19,7 +19,9 @@ spec:
     spec:
       containers:
         - name: crm
-          # Тег обновляется автоматически job'ой update-gitops (GitOps) после промоушена в staging.
+          # Тег (build-<N>) обновляется автоматически джобой update-gitops (GitOps):
+          # после промоушена образа в staging она коммитит новый тег в ветку gitops,
+          # а контроллер (Argo CD / Flux) применяет его в кластере.
           image: ghcr.io/tyques/ci-lab3:staging
           imagePullPolicy: Always
           ports:
