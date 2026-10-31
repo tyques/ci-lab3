@@ -182,10 +182,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Определение имени образа и тега
+      - name: Определение образа и неизменяемого тега деплоя
         run: |
           echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
           echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          # Манифест пиннится на конкретную неизменяемую версию, а не на движущийся :staging,
+          # иначе sed ничего не меняет и GitOps-коммита не происходит.
+          echo "DEPLOY_TAG=build-${{ github.run_number }}" >> "$GITHUB_ENV"
 
       - name: Подготовка ветки gitops (создаётся из master при первом запуске)
         run: |
@@ -199,7 +202,7 @@ jobs:
 
       - name: Обновление тега образа в манифесте
         run: |
-          sed -i "s|image: ghcr.io/[^:]*:.*|image: ${IMAGE}:staging|" k8s/crm-deployment.yaml
+          sed -i "s|image: ghcr.io/[^:]*:.*|image: ${IMAGE}:${DEPLOY_TAG}|" k8s/crm-deployment.yaml
           grep -n "image:" k8s/crm-deployment.yaml
 
       - name: Коммит и пуш в ветку gitops
@@ -208,6 +211,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Манифест уже актуален — изменений нет"
           else
-            git commit -m "chore(gitops): promote image to staging (${SHORT_SHA})"
+            git commit -m "chore(gitops): deploy ${DEPLOY_TAG} (${SHORT_SHA})"
             git push origin gitops
           fi
